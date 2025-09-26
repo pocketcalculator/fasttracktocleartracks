@@ -19,7 +19,20 @@ except ImportError:
     sys.exit(1)
 
 # Configuration
-INCOMING_DIR = Path("/home/paulsczurek/code/fasttracktocleartracks/iot/raspi/image/incoming")
+def get_output_directory():
+    """Auto-detect output directory or use fallback"""
+    script_dir = Path(__file__).parent
+    # Look for ../image/incoming relative to script
+    auto_incoming = script_dir.parent / "image" / "incoming"
+    if auto_incoming.exists():
+        return auto_incoming
+    else:
+        # Fallback to current directory + incoming
+        fallback_dir = script_dir / "incoming"
+        print(f"Warning: Using fallback directory: {fallback_dir}")
+        return fallback_dir
+
+INCOMING_DIR = get_output_directory()
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 FILENAME = f"captured_{TIMESTAMP}.jpg"
 FILEPATH = INCOMING_DIR / FILENAME

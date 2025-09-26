@@ -3,8 +3,26 @@
 # Raspberry Pi Camera Image Capture Script with Adaptive Exposure
 # Optimized for outdoor photography with varying lighting conditions
 
+# Function to auto-detect incoming directory
+get_incoming_dir() {
+    # Get the directory where this script is located
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    
+    # Try ../image/incoming relative to script
+    AUTO_INCOMING="${SCRIPT_DIR}/../image/incoming"
+    
+    if [ -d "$AUTO_INCOMING" ]; then
+        echo "$AUTO_INCOMING"
+    else
+        # Fallback to script_dir/incoming
+        FALLBACK_DIR="${SCRIPT_DIR}/incoming"
+        echo "Warning: Using fallback directory: $FALLBACK_DIR" >&2
+        echo "$FALLBACK_DIR"
+    fi
+}
+
 # Configuration
-INCOMING_DIR="/home/paulsczurek/code/fasttracktocleartracks/iot/raspi/image/incoming"
+INCOMING_DIR="${1:-$(get_incoming_dir)}"  # Use first argument or auto-detect
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 FILENAME="captured_${TIMESTAMP}.jpg"
 FILEPATH="${INCOMING_DIR}/${FILENAME}"

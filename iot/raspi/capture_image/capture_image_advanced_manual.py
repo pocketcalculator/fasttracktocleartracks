@@ -317,10 +317,27 @@ def main():
     parser.add_argument("--flip-v", action='store_true', help="Flip vertically")
     parser.add_argument("--preview", type=int, default=2, help="Preview time in seconds")
     parser.add_argument("--list-props", action='store_true', help="List camera properties")
+    parser.add_argument("--output-dir", type=str, 
+                       help="Output directory for captured images (default: auto-detect or use ../image/incoming)")
     
     args = parser.parse_args()
     
-    incoming_dir = "/home/paulsczurek/code/fasttracktocleartracks/iot/raspi/image/incoming"
+    # Determine output directory
+    if args.output_dir:
+        incoming_dir = args.output_dir
+    else:
+        # Try to auto-detect based on script location
+        script_dir = Path(__file__).parent
+        # Look for ../image/incoming relative to script
+        auto_incoming = script_dir.parent / "image" / "incoming"
+        if auto_incoming.exists():
+            incoming_dir = str(auto_incoming)
+        else:
+            # Fallback to current directory + incoming
+            incoming_dir = str(script_dir / "incoming")
+            print(f"Warning: Using fallback directory: {incoming_dir}")
+            print("Consider using --output-dir to specify the correct path")
+    
     camera = RaspberryPiCamera(incoming_dir)
     
     if args.list_props:

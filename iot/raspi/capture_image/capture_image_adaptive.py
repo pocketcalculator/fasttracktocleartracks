@@ -17,12 +17,14 @@ try:
     from libcamera import Transform, controls
     from PIL import Image, ImageStat
     from PIL.ExifTags import TAGS
+    from PIL.ExifTags import GPSTAGS
+    import piexif
     import numpy as np
 except ImportError as e:
     print(f"Error: Required library not installed - {e}")
     print("Install with:")
     print("  sudo apt install python3-picamera2")
-    print("  pip3 install pillow numpy")
+    print("  pip3 install pillow numpy piexif")
     sys.exit(1)
 
 class RaspberryPiCamera:
@@ -127,37 +129,151 @@ class RaspberryPiCamera:
         recommended = lighting_info["recommended_settings"]
         controls_dict = {}
         
-        # Enable auto-exposure but with compensation
-        controls_dict[controls.AeEnable] = True
+        try:
+            # Enable auto-exposure but with compensation
+            controls_dict[controls.AeEnable] = True
+            
+            # Apply exposure compensation based on lighting conditions
+            if "brightness_compensation" in recommended:
+                compensation = recommended["brightness_compensation"]
+                controls_dict[controls.ExposureValue] = compensation
+            
+            # Adjust ISO sensitivity based on conditions
+            if base_iso:
+                iso_multiplier = recommended.get("iso_boost", 1.0)
+                adjusted_iso = min(1600, int(base_iso * iso_multiplier))  # Cap at 1600
+                controls_dict[controls.AnalogueGain] = adjusted_iso / 100.0
+            
+            # Set exposure mode preferences (skip this for now to avoid compatibility issues)
+            # exposure_mode = recommended.get("exposure_mode", "normal")
+            # if exposure_mode == "long":
+            #     # For dark conditions, allow longer exposures
+            #     try:
+            #         controls_dict[controls.AeExposureMode] = controls.AeExposureModeEnum.Long
+            #     except AttributeError:
+            #         # Fallback if enum not available
+            #         pass
+            # elif exposure_mode == "short":
+            #     # For bright conditions, prefer shorter exposures
+            #     try:
+            #         controls_dict[controls.AeExposureMode] = controls.AeExposureModeEnum.Short
+            #     except AttributeError:
+            #         pass
         
-        # Apply exposure compensation based on lighting conditions
-        if "brightness_compensation" in recommended:
-            compensation = recommended["brightness_compensation"]
-            controls_dict[controls.ExposureValue] = compensation
-        
-        # Adjust ISO sensitivity based on conditions
-        if base_iso:
-            iso_multiplier = recommended.get("iso_boost", 1.0)
-            adjusted_iso = min(1600, int(base_iso * iso_multiplier))  # Cap at 1600
-            controls_dict[controls.AnalogueGain] = adjusted_iso / 100.0
-        
-        # Set exposure mode preferences
-        exposure_mode = recommended.get("exposure_mode", "normal")
-        if exposure_mode == "long":
-            # For dark conditions, allow longer exposures
-            try:
-                controls_dict[controls.AeExposureMode] = controls.AeExposureModeEnum.Long
-            except AttributeError:
-                # Fallback if enum not available
-                pass
-        elif exposure_mode == "short":
-            # For bright conditions, prefer shorter exposures
-            try:
-                controls_dict[controls.AeExposureMode] = controls.AeExposureModeEnum.Short
-            except AttributeError:
-                pass
+        except Exception as e:
+            print(f"Warning: Error setting adaptive controls: {e}")
+            # Return minimal safe controls
+            return {controls.AeEnable: True}
         
         return controls_dict
+        
+    def _convert_metadata_safely(self, metadata):
+        """
+        Safely convert camera metadata to a JSON-serializable format
+        Handles libcamera ControlId objects and other non-serializable types
+        """
+        converted = {}
+        for key, value in metadata.items():
+            try:
+                # Convert key to string, handling ControlId objects
+                if hasattr(key, '__str__'):
+                    str_key = str(key)
+                else:
+                    str_key = repr(key)
+                
+                # Convert value to serializable format
+                if value is None:
+                    converted[str_key] = None
+                elif isinstance(value, (int, float, str, bool)):
+                    converted[str_key] = value
+                elif isinstance(value, (list, tuple)):
+                    # Handle arrays/tuples
+                    converted[str_key] = [str(item) if not isinstance(item, (int, float, str, bool)) else item for item in value]
+                else:
+                    # For complex objects, convert to string representation
+                    converted[str_key] = str(value)
+            except Exception as e:
+                # If conversion fails, store the error info
+                converted[f"conversion_error_{repr(key)}"] = f"Failed to convert: {str(e)}"
+        
+        return converted
+        
+    def _embed_metadata_in_exif(self, filepath, capture_metadata):
+        """
+        Embed capture metadata into JPEG EXIF data
+        """
+        try:
+            # Load the existing EXIF data
+            exif_dict = piexif.load(str(filepath))
+            
+            # Add our custom metadata to the UserComment field (allows longer text)
+            metadata_json = json.dumps(capture_metadata, separators=(',', ':'))
+            
+            # EXIF UserComment format: encoding + actual comment
+            # We'll use ASCII encoding (0x41534349 = "ASCI")
+            user_comment = b"JPEG\x00\x00\x00\x00" + metadata_json.encode('utf-8')
+            exif_dict['Exif'][piexif.ExifIFD.UserComment] = user_comment
+            
+            # Also add some key information to standard EXIF fields
+            settings = capture_metadata.get('settings', {})
+            lighting = capture_metadata.get('lighting_analysis', {})
+            
+            # Image description with lighting condition
+            if lighting.get('description'):
+                description = f"Adaptive capture: {lighting['description']} (brightness: {lighting.get('brightness', 'N/A'):.1f})"
+                exif_dict['0th'][piexif.ImageIFD.ImageDescription] = description.encode('utf-8')
+            
+            # Software/processing info
+            software_info = f"RaspberryPi Adaptive Camera - Quality:{settings.get('quality', 85)}"
+            if settings.get('adaptive_exposure'):
+                software_info += " - Adaptive"
+            if settings.get('exposure_bracketing'):
+                software_info += " - Bracketed"
+            exif_dict['0th'][piexif.ImageIFD.Software] = software_info.encode('utf-8')
+            
+            # Camera settings in maker note area if available
+            camera_meta = capture_metadata.get('camera_metadata', {})
+            if 'ExposureTime' in camera_meta:
+                # Convert microseconds to rational (1/shutter_speed format)
+                exposure_us = camera_meta['ExposureTime']
+                if isinstance(exposure_us, (int, float)) and exposure_us > 0:
+                    # Convert to standard EXIF format (seconds as rational)
+                    exposure_sec = exposure_us / 1000000.0
+                    if exposure_sec < 1:
+                        # Express as 1/X for fast shutter speeds
+                        denominator = int(1 / exposure_sec)
+                        exif_dict['Exif'][piexif.ExifIFD.ExposureTime] = (1, denominator)
+                    else:
+                        # Express as rational for longer exposures
+                        numerator = int(exposure_sec * 1000)
+                        exif_dict['Exif'][piexif.ExifIFD.ExposureTime] = (numerator, 1000)
+            
+            # ISO setting
+            if 'AnalogueGain' in camera_meta:
+                analogue_gain = camera_meta['AnalogueGain']
+                if isinstance(analogue_gain, (int, float)):
+                    iso_equivalent = int(analogue_gain * 100)
+                    exif_dict['Exif'][piexif.ExifIFD.ISOSpeedRatings] = iso_equivalent
+            
+            # Color temperature
+            if 'ColourTemperature' in camera_meta:
+                color_temp = camera_meta['ColourTemperature']
+                if isinstance(color_temp, (int, float)):
+                    exif_dict['Exif'][piexif.ExifIFD.WhiteBalance] = 1  # Manual white balance
+                    exif_dict['Exif'][piexif.ExifIFD.ColorSpace] = 1    # sRGB
+            
+            # Convert back to bytes and save
+            exif_bytes = piexif.dump(exif_dict)
+            
+            # Re-save the image with new EXIF data
+            img = Image.open(filepath)
+            img.save(filepath, "JPEG", quality=settings.get('quality', 85), exif=exif_bytes)
+            
+            return True
+            
+        except Exception as e:
+            print(f"Warning: Could not embed metadata in EXIF: {e}")
+            return False
         
     def list_camera_properties(self):
         """List available camera properties and controls"""
@@ -181,7 +297,7 @@ class RaspberryPiCamera:
     def capture_image(self, width=1920, height=1080, quality=85, 
                      exposure_time=None, iso=None, white_balance=None,
                      rotation=0, flip_h=False, flip_v=False, preview_time=2,
-                     adaptive_exposure=True, exposure_bracketing=False):
+                     adaptive_exposure=True, exposure_bracketing=False, use_json_metadata=False):
         """
         Capture an image with advanced settings and adaptive exposure
         
@@ -196,6 +312,7 @@ class RaspberryPiCamera:
             preview_time: Preview time in seconds before capture
             adaptive_exposure: Enable intelligent exposure adaptation
             exposure_bracketing: Take multiple shots with different exposures
+            use_json_metadata: Save metadata to JSON file instead of EXIF (default: False)
         """
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -236,8 +353,11 @@ class RaspberryPiCamera:
                 
                 # Apply adaptive settings
                 adaptive_controls = self.apply_adaptive_settings(lighting_info, base_iso=iso or 400)
-                self.picam2.set_controls(adaptive_controls)
-                print(f"Applied adaptive controls for {lighting_info['condition']} conditions")
+                try:
+                    self.picam2.set_controls(adaptive_controls)
+                    print(f"Applied adaptive controls for {lighting_info['condition']} conditions")
+                except Exception as e:
+                    print(f"Warning: Could not apply adaptive controls, using defaults: {e}")
                 
                 # Additional stabilization time after applying new settings
                 time.sleep(1)
@@ -340,6 +460,12 @@ class RaspberryPiCamera:
             self.picam2.stop()
             
             # Enhanced metadata
+            try:
+                safe_metadata = self._convert_metadata_safely(metadata)
+            except Exception as e:
+                print(f"Warning: Could not convert camera metadata: {e}")
+                safe_metadata = {"error": f"Metadata conversion failed: {e}"}
+            
             capture_metadata = {
                 "timestamp": timestamp,
                 "filename": filename,
@@ -357,7 +483,7 @@ class RaspberryPiCamera:
                     "exposure_bracketing": exposure_bracketing
                 },
                 "lighting_analysis": lighting_info,
-                "camera_metadata": {k: str(v) for k, v in metadata.items()}
+                "camera_metadata": safe_metadata
             }
             
             # Add final image analysis
@@ -374,8 +500,23 @@ class RaspberryPiCamera:
                 except:
                     pass
             
-            with open(metadata_file, 'w') as f:
-                json.dump(capture_metadata, f, indent=2)
+            # Store metadata based on user preference
+            if use_json_metadata:
+                # Save to separate JSON file (legacy method)
+                with open(metadata_file, 'w') as f:
+                    json.dump(capture_metadata, f, indent=2)
+                metadata_saved_msg = f"✓ Metadata saved: {metadata_file.name}"
+            else:
+                # Embed metadata into EXIF data (default method)
+                metadata_embedded = False
+                if filepath.exists():
+                    print("Embedding metadata into EXIF...")
+                    metadata_embedded = self._embed_metadata_in_exif(filepath, capture_metadata)
+                
+                if metadata_embedded:
+                    metadata_saved_msg = "✓ Metadata embedded in EXIF data"
+                else:
+                    metadata_saved_msg = "⚠ Metadata could not be embedded (image still captured)"
             
             # Verify and report
             if filepath.exists():
@@ -390,7 +531,8 @@ class RaspberryPiCamera:
                     if final_brightness != "N/A":
                         print(f"✓ Final image brightness: {final_brightness:.1f}")
                 
-                print(f"✓ Metadata saved: {metadata_file.name}")
+                print(metadata_saved_msg)
+                
                 return True
             else:
                 print("✗ Error: Image file not created!")
@@ -426,11 +568,29 @@ def main():
                        help="Disable adaptive exposure (use standard auto-exposure)")
     parser.add_argument("--bracket", action='store_true', 
                        help="Enable exposure bracketing (takes best of 3 exposures)")
+    parser.add_argument("--json-metadata", action='store_true', 
+                       help="Save metadata to separate JSON file instead of embedding in EXIF")
     parser.add_argument("--list-props", action='store_true', help="List camera properties")
+    parser.add_argument("--output-dir", type=str, 
+                       help="Output directory for captured images (default: auto-detect or use ../image/incoming)")
     
     args = parser.parse_args()
-    
-    incoming_dir = "/home/paulsczurek/code/fasttracktocleartracks/iot/raspi/image/incoming"
+
+    # Determine output directory
+    if args.output_dir:
+        incoming_dir = args.output_dir
+    else:
+        # Try to auto-detect based on script location
+        script_dir = Path(__file__).parent
+        # Look for ../image/incoming relative to script
+        auto_incoming = script_dir.parent / "image" / "incoming"
+        if auto_incoming.exists():
+            incoming_dir = str(auto_incoming)
+        else:
+            # Fallback to current directory + incoming
+            incoming_dir = str(script_dir / "incoming")
+            print(f"Warning: Using fallback directory: {incoming_dir}")
+            print("Consider using --output-dir to specify the correct path")
     camera = RaspberryPiCamera(incoming_dir)
     
     if args.list_props:
@@ -458,7 +618,8 @@ def main():
         flip_v=args.flip_v,
         preview_time=args.preview,
         adaptive_exposure=not args.no_adaptive,
-        exposure_bracketing=args.bracket
+        exposure_bracketing=args.bracket,
+        use_json_metadata=args.json_metadata
     )
     
     if success:
